@@ -6,18 +6,23 @@
 #include <linux/kobject.h>
 #include <linux/spinlock.h>
 #include <linux/blkdev.h>
+#include <linux/printk.h>
 
 struct dmp_c {
         struct dm_dev *dev;
         unsigned long long r_ops;
         unsigned long long w_ops;
         unsigned long long rw_ops;
-        unsigned long long r_avg_size;
-        unsigned long long w_avg_size;
-        unsigned long long rw_avg_size;
+        unsigned long long r_size_sum;
+        unsigned long long w_size_sum;
+        unsigned long long rw_size_sum;
         struct kobject kobj;
         spinlock_t stat_lock;
 };
+
+static unsigned long long get_avg(unsigned long long size, unsigned long long ops) {
+        return ops ? size / ops : 0;
+}
 
 static ssize_t volumes_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
@@ -26,18 +31,17 @@ static ssize_t volumes_show(struct kobject *kobj, struct kobj_attribute *attr, c
         return sprintf(buf,
                   "read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\n avg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
                   dmpc->r_ops,
-                  dmpc->r_avg_size,
+                  get_avg(dmpc->r_size_sum, dmpc->r_ops),
                   dmpc->w_ops,
-                  dmpc->w_avg_size,
+                  get_avg(dmpc->w_size_sum, dmpc->w_ops),
                   dmpc->rw_ops,
-                  dmpc->rw_avg_size);
+                  get_avg(dmpc->rw_size_sum, dmpc->rw_ops));
 }
 
 static void dmp_kobj_release(struct kobject *kobj) {
         kfree(kobj);
 }
 
-// Volumes attr
 static struct kobj_attribute volumes_attr = __ATTR_RO(volumes);
 
 /*
@@ -66,7 +70,6 @@ static struct kobj_type dmp_kobj_type = {
  */
 static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
-        DEFINE_SPINLOCK(stat_lock);
         struct dmp_c *dmpc;
         int ret;
 
@@ -105,7 +108,7 @@ static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 return ret;
         }
 
-        dmpc->stat_lock = stat_lock;
+        spin_lock_init(&dmpc->stat_lock);
 
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
@@ -131,6 +134,7 @@ static int dmp_map(struct dm_target *ti, struct bio *bio)
 {
 	struct dmp_c *dmpc = ti->private;
         unsigned int cur_size = bio->bi_iter.bi_size;
+        unsigned int cur_sec = bio_sectors(bio);
 
         /*
          * Update statistics
@@ -138,21 +142,21 @@ static int dmp_map(struct dm_target *ti, struct bio *bio)
         switch (bio_op(bio)) {
 	case REQ_OP_READ:
                 spin_lock(&dmpc->stat_lock);
-                dmpc->r_avg_size = (dmpc->r_avg_size * dmpc->r_ops + cur_size) / (dmpc->r_ops + 1);
-                dmpc->rw_avg_size = (dmpc->rw_avg_size * dmpc->rw_ops + cur_size) / (dmpc->rw_ops + 1);
+                dmpc->r_size_sum += cur_size;
+                dmpc->rw_size_sum += cur_size;
 		dmpc->r_ops++;
                 dmpc->rw_ops++;
                 spin_unlock(&dmpc->stat_lock);
 		break;
 	case REQ_OP_WRITE:
                 spin_lock(&dmpc->stat_lock);
-                dmpc->w_avg_size = (dmpc->w_avg_size * dmpc->w_ops + cur_size) / (dmpc->w_ops + 1);
-                dmpc->rw_avg_size = (dmpc->rw_avg_size * dmpc->rw_ops + cur_size) / (dmpc->rw_ops + 1);
+                dmpc->w_size_sum += cur_size;
+                dmpc->rw_size_sum += cur_size;
                 dmpc->w_ops++;
                 dmpc->rw_ops++;
                 spin_unlock(&dmpc->stat_lock);
                 break;
-	}
+        }
 
 	bio_set_dev(bio, dmpc->dev->bdev);
         return DM_MAPIO_REMAPPED;
