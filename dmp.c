@@ -1,111 +1,91 @@
 #include <linux/module.h>
-#include <linux/init.h>
+#include <linux/sysfs.h>
+#include <linux/spinlock.h>
 #include <linux/device-mapper.h>
 #include <linux/bio.h>
-#include <linux/sysfs.h>
-#include <linux/kobject.h>
-#include <linux/spinlock.h>
-#include <linux/blkdev.h>
-#include <linux/printk.h>
+#include <linux/delay.h>
+
+#include "stats.h"
+
+#define dm_name_from_target(ti) \
+        (dm_disk(dm_table_get_md(ti->table))->disk_name);
 
 struct dmp_c {
-        struct dm_dev *dev;
-        unsigned long long r_ops;
-        unsigned long long w_ops;
-        unsigned long long rw_ops;
-        unsigned long long r_size_sum;
-        unsigned long long w_size_sum;
-        unsigned long long rw_size_sum;
+        struct dm_dev *dev; /* Underlying block device */
+        struct dmp_stats stat;
         struct kobject kobj;
         spinlock_t stat_lock;
 };
 
-static unsigned long long get_avg(unsigned long long size, unsigned long long ops) {
-        return ops ? size / ops : 0;
-}
-
-static ssize_t volumes_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t reqs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
         struct dmp_c *dmpc = container_of(kobj, struct dmp_c, kobj);
-
-        return sprintf(buf,
+        
+        return sysfs_emit(buf,
                   "read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\n avg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
-                  dmpc->r_ops,
-                  get_avg(dmpc->r_size_sum, dmpc->r_ops),
-                  dmpc->w_ops,
-                  get_avg(dmpc->w_size_sum, dmpc->w_ops),
-                  dmpc->rw_ops,
-                  get_avg(dmpc->rw_size_sum, dmpc->rw_ops));
+                  get_read_ops(&dmpc->stat),
+                  get_read_avg_size(&dmpc->stat),
+                  get_write_ops(&dmpc->stat),
+                  get_write_avg_size(&dmpc->stat),
+                  get_total_ops(&dmpc->stat),
+                  get_total_avg_size(&dmpc->stat));
 }
 
 static void dmp_kobj_release(struct kobject *kobj) {
         kfree(kobj);
 }
 
-static struct kobj_attribute volumes_attr = __ATTR_RO(volumes);
-
-/*
- * /sys/module/dmp/stat/volumes
- */
-static struct attribute *dmp_attrs[] = {
-        &volumes_attr.attr,
-        NULL,
-};
-
-/*
- * /sys/module/dmp/stat/
- */
-static struct attribute_group dmp_stat_group = {
-        .name = "stat",
-        .attrs = dmp_attrs,
-};
+static struct kobj_attribute reqs_attr = __ATTR_RO(reqs);
 
 static struct kobj_type dmp_kobj_type = {
         .release = dmp_kobj_release,
         .sysfs_ops = &kobj_sysfs_ops,
 };
 
+static struct kset *dmp_dev_stats_kset;
+
 /*
  * Construct a device mapper proxy that collects statistics of I/O operations: <dev_path>
  */
 static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
-        struct dmp_c *dmpc;
         int ret;
+        struct dmp_c *dmpc;
+        char *name;
 
         if (argc != 1) {
                 ti->error = "Invalid argument count";
                 return -EINVAL;
         }
 
+        if (!dmp_dev_stats_kset) {
+                ti->error = "Internal error (sysfs base missing)";
+                return -EFAULT;
+        }
+
         dmpc = kzalloc(sizeof(*dmpc), GFP_KERNEL);
         if (dmpc == NULL) {
-                ti->error = "Cannot allocate dmp context";
+                ti->error = "Failed to allocate dmp context";
                 return -ENOMEM;
         }
 
         ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dmpc->dev);
 	if (ret) {
-                kfree(dmpc);
-		ti->error = "Device lookup failed";
-                return ret;
-	}
-
-        ret = kobject_init_and_add(&dmpc->kobj, &dmp_kobj_type, &THIS_MODULE->mkobj.kobj, "%s", dm_table_device_name(ti->table));
-                if (ret) {
-	        dm_put_device(ti, dmpc->dev);
-                kfree(dmpc);
-		ti->error = "Cannot init kobject";
-                return ret;
+		ti->error = "Failed to get the underlying device";
+                goto dev_err;
         }
 
-        ret = sysfs_create_group(&dmpc->kobj, &dmp_stat_group);
+        name = dm_name_from_target(ti);
+        ret = kobject_init_and_add(&dmpc->kobj, &dmp_kobj_type, &dmp_dev_stats_kset->kobj, name);
         if (ret) {
-                kobject_put(&dmpc->kobj);
-                dm_put_device(ti, dmpc->dev);
-                kfree(dmpc);
+		ti->error = "Failed to init kobject";
+                goto kobj_err;
+        }
+
+        ret = sysfs_create_file(&dmpc->kobj, &reqs_attr.attr);
+        if (ret) {
 		ti->error = "Cannot create sysfs group";
-                return ret;
+                goto sysfs_err;
         }
 
         spin_lock_init(&dmpc->stat_lock);
@@ -116,25 +96,29 @@ static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_write_zeroes_bios = 1;
 	ti->private = dmpc;
 	return 0;
+
+sysfs_err:
+        kobject_put(&dmpc->kobj);
+kobj_err:
+        dm_put_device(ti, dmpc->dev);
+dev_err:
+        kfree(dmpc);
+        return ret;
 }
 
 static void dmp_dtr(struct dm_target *ti)
 {
 	struct dmp_c *dmpc = ti->private;
-        sysfs_remove_group(&dmpc->kobj, &dmp_stat_group);
+        sysfs_remove_file(&dmpc->kobj, &reqs_attr.attr);
         kobject_put(&dmpc->kobj);
-	dm_put_device(ti, dmpc->dev);
+        dm_put_device(ti, dmpc->dev);
 	kfree(dmpc);
 }
 
-/*
-* Return zeros only on reads
-*/
 static int dmp_map(struct dm_target *ti, struct bio *bio)
 {
 	struct dmp_c *dmpc = ti->private;
         unsigned int cur_size = bio->bi_iter.bi_size;
-        unsigned int cur_sec = bio_sectors(bio);
 
         /*
          * Update statistics
@@ -142,19 +126,17 @@ static int dmp_map(struct dm_target *ti, struct bio *bio)
         switch (bio_op(bio)) {
 	case REQ_OP_READ:
                 spin_lock(&dmpc->stat_lock);
-                dmpc->r_size_sum += cur_size;
-                dmpc->rw_size_sum += cur_size;
-		dmpc->r_ops++;
-                dmpc->rw_ops++;
+                dmpc->stat.r_size_sum += cur_size;
+		dmpc->stat.r_ops++;
                 spin_unlock(&dmpc->stat_lock);
 		break;
 	case REQ_OP_WRITE:
                 spin_lock(&dmpc->stat_lock);
-                dmpc->w_size_sum += cur_size;
-                dmpc->rw_size_sum += cur_size;
-                dmpc->w_ops++;
-                dmpc->rw_ops++;
+                dmpc->stat.w_size_sum += cur_size;
+                dmpc->stat.w_ops++;
                 spin_unlock(&dmpc->stat_lock);
+                break;
+        default:
                 break;
         }
 
@@ -172,10 +154,11 @@ static void dmp_status(struct dm_target *ti, status_type_t type,
 	case STATUSTYPE_INFO:
 		result[0] = '\0';
 		break;
-
 	case STATUSTYPE_TABLE:
 		DMEMIT("%s", dmpc->dev->name);
 		break;
+        default:
+                break;
 	}
 }
 
@@ -190,7 +173,33 @@ static struct target_type dmp_target = {
 	.status = dmp_status,
 };
 
-module_dm(dmp);
+static int __init dmp_init(void)
+{
+        int ret;
+
+        ret = dm_register_target(&dmp_target);
+        if (ret < 0) {
+            return ret;
+        }
+    
+        dmp_dev_stats_kset = kset_create_and_add("dev_stats", NULL, &THIS_MODULE->mkobj.kobj);
+        if (!dmp_dev_stats_kset) {
+            dm_unregister_target(&dmp_target);
+            return -ENOMEM;
+        }
+    
+        return ret;
+}
+
+static void __exit dmp_exit(void)
+{
+        dm_unregister_target(&dmp_target);
+        kset_unregister(dmp_dev_stats_kset);
+}
+
+module_init(dmp_init);
+module_exit(dmp_exit);
+
 MODULE_AUTHOR("Artemii Patov <patov.988@gmail.com>");
 MODULE_DESCRIPTION(DM_NAME "Device mapper proxy that collects statistics of I/O operations");
 MODULE_LICENSE("GPL");
