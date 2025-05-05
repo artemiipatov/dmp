@@ -58,3 +58,6 @@ Read the statistics:
 cat /sys/module/dmp/stat/test-dmp/reqs
 cat /sys/module/dmp/stat/volumes
 ```
+
+# Testing
+Details on how the module was tested can be found in [TESTING.md](TESTING.md).
