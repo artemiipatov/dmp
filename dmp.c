@@ -2,7 +2,6 @@
 
 #include <linux/module.h>
 #include <linux/sysfs.h>
-#include <linux/spinlock.h>
 #include <linux/device-mapper.h>
 #include <linux/bio.h>
 
@@ -12,36 +11,62 @@
 (dm_disk(dm_table_get_md(ti->table))->disk_name)
 
 /*
- * Current dmp device context
+ * Each dmp device context
  */
 struct dmp_c {
 	struct dm_dev *dev; /* Underlying block device */
-	struct dmp_stats stat; /* Stats of requests to underlying device */
+	struct dmp_stats stats; /* Stats of requests to underlying device */
 	struct kobject kobj; /* Parent kobject for current dmp */
-	spinlock_t stat_lock; /* Spinlock for operations with dmp_stats */
 };
 
+/*
+ * Global statistics covering all devices
+ */
+static struct dmp_stats *global_stats;
+
+/*
+ * Shows statistics in sysfs
+ */
+static ssize_t print_stats(char *buf, struct dmp_stats *stats)
+{
+	return sysfs_emit(buf,
+		"read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\navg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
+		get_read_ops(stats),
+		get_read_avg_size(stats),
+		get_write_ops(stats),
+		get_write_avg_size(stats),
+		get_total_ops(stats),
+		get_total_avg_size(stats));
+}
+
+/*
+ * /sys/module/dmp/stat/volumes
+ */
+static ssize_t volumes_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return print_stats(buf, global_stats);
+}
+
+static struct kobj_attribute volumes_attr = __ATTR_RO(volumes);
+
+/*
+ * /sys/module/dmp/stat/dm-<X>/reqs
+ */
 static ssize_t reqs_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 char *buf)
 {
 	struct dmp_c *dmpc = container_of(kobj, struct dmp_c, kobj);
 
-	return sysfs_emit(buf,
-		  "read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\navg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
-		  get_read_ops(&dmpc->stat),
-		  get_read_avg_size(&dmpc->stat),
-		  get_write_ops(&dmpc->stat),
-		  get_write_avg_size(&dmpc->stat),
-		  get_total_ops(&dmpc->stat),
-		  get_total_avg_size(&dmpc->stat));
-}
-
-static void dmp_kobj_release(struct kobject *kobj)
-{
-	kfree(kobj);
+	return print_stats(buf, &dmpc->stats);
 }
 
 static struct kobj_attribute reqs_attr = __ATTR_RO(reqs);
+
+static void dmp_kobj_release(struct kobject *kobj)
+{
+	/* kobject is released in dmp_dtr */
+}
 
 static struct kobj_type dmp_kobj_type = {
 	.release = dmp_kobj_release,
@@ -52,8 +77,10 @@ static struct kset *dmp_dev_stats_kset;
 
 /*
  * Construct a device mapper proxy
- * that collects statistics of I/O operations.
- * Statistics can be found in /sys/module/dmp/dev_stats/dm-<X>/reqs
+ * that collects statistics of read, write operations.
+ * Statistics can be found in
+ * /sys/module/dmp/dev_stats/dm-<X>/reqs for each device,
+ * /sys/module/dmp/stat/volumes for all devices
  */
 static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
@@ -98,7 +125,7 @@ static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto sysfs_err;
 	}
 
-	spin_lock_init(&dmpc->stat_lock);
+	spin_lock_init(&dmpc->stats.stat_lock);
 
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
@@ -126,6 +153,28 @@ static void dmp_dtr(struct dm_target *ti)
 	kfree(dmpc);
 }
 
+static void update_stats(struct dmp_stats *stats, struct bio *bio)
+{
+	unsigned int cur_size = bio->bi_iter.bi_size;
+
+	switch (bio_op(bio)) {
+	case REQ_OP_READ:
+		spin_lock(&stats->stat_lock);
+		stats->r_size_sum += cur_size;
+		stats->r_ops++;
+		spin_unlock(&stats->stat_lock);
+		break;
+	case REQ_OP_WRITE:
+		spin_lock(&stats->stat_lock);
+		stats->w_size_sum += cur_size;
+		stats->w_ops++;
+		spin_unlock(&stats->stat_lock);
+		break;
+	default:
+		break;
+	}
+}
+
 /*
  * Identically remaps all requests to underlying device.
  * Collects read, write requests statistics
@@ -133,29 +182,11 @@ static void dmp_dtr(struct dm_target *ti)
 static int dmp_map(struct dm_target *ti, struct bio *bio)
 {
 	struct dmp_c *dmpc = ti->private;
-	unsigned int cur_size = bio->bi_iter.bi_size;
 
-	/*
-	 * Update statistics
-	 */
-	switch (bio_op(bio)) {
-	case REQ_OP_READ:
-		spin_lock(&dmpc->stat_lock);
-		dmpc->stat.r_size_sum += cur_size;
-		dmpc->stat.r_ops++;
-		spin_unlock(&dmpc->stat_lock);
-		break;
-	case REQ_OP_WRITE:
-		spin_lock(&dmpc->stat_lock);
-		dmpc->stat.w_size_sum += cur_size;
-		dmpc->stat.w_ops++;
-		spin_unlock(&dmpc->stat_lock);
-		break;
-	default:
-		break;
-	}
-
+	update_stats(&dmpc->stats, bio);
+	update_stats(global_stats, bio);
 	bio_set_dev(bio, dmpc->dev->bdev);
+
 	return DM_MAPIO_REMAPPED;
 }
 
@@ -201,17 +232,37 @@ static int __init dmp_init(void)
 	dmp_dev_stats_kset = kset_create_and_add("dev_stats", NULL,
 						 &THIS_MODULE->mkobj.kobj);
 	if (!dmp_dev_stats_kset) {
-		dm_unregister_target(&dmp_target);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto kset_err;
 	}
 
+	global_stats = kzalloc(sizeof(*global_stats), GFP_KERNEL);
+	if (!global_stats) {
+		ret = -ENOMEM;
+		goto global_stats_err;
+	}
+
+	ret = sysfs_create_file(&dmp_dev_stats_kset->kobj, &volumes_attr.attr);
+	if (ret)
+		goto sysfs_err;
+
+	return ret;
+
+sysfs_err:
+	kfree(global_stats);
+global_stats_err:
+	kset_unregister(dmp_dev_stats_kset);
+kset_err:
+	dm_unregister_target(&dmp_target);
 	return ret;
 }
 
 static void __exit dmp_exit(void)
 {
-	dm_unregister_target(&dmp_target);
+	sysfs_remove_file(&dmp_dev_stats_kset->kobj, &volumes_attr.attr);
+	kfree(global_stats);
 	kset_unregister(dmp_dev_stats_kset);
+	dm_unregister_target(&dmp_target);
 }
 
 module_init(dmp_init);
