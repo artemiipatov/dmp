@@ -23,7 +23,8 @@ TABLE="0 $SIZE dmp $LOOP_DEV"
 dmsetup create $DMP_DEVICE_NAME --table "$TABLE"
 
 # Test case: write 16MB of random data to device mapper,
-# read from the underlying storage, and compare
+# read from the underlying storage, and compare.
+# Note: using oflag=direct everywhere.
 dd if=/dev/urandom of=$INPUT_DATA bs=1M count=16 conv=notrunc oflag=direct
 dd if=$INPUT_DATA of=$MAPPER_DEVICE bs=1M count=16 conv=notrunc oflag=direct
 dd if=$LOOP_FILE of=$OUTPUT_DATA bs=1M count=16 conv=notrunc oflag=direct

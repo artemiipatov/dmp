@@ -20,7 +20,8 @@ SIZE=$(blockdev --getsz $LOOP_DEV)
 TABLE="0 $SIZE dmp $LOOP_DEV"
 dmsetup create $DMP_DEVICE_NAME --table "$TABLE"
 
-# Verify using fio: 1 GB of concurrent random writes with different block sizes
+# Verify using fio: 1 GB of concurrent random writes with different block sizes.
+# Note: using --direct=1 everywhere
 fio --name=ls --ioengine=libaio --iodepth=8 --rw=randwrite \
 --bssplit=4k/30:8k/30:16k/30:512k/10 --direct=1 --numjobs=8 \
 --size=1G --filename=$MAPPER_DEVICE --verify=sha256 --do_verify=0 \
