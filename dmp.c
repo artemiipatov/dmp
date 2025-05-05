@@ -3,26 +3,30 @@
 #include <linux/spinlock.h>
 #include <linux/device-mapper.h>
 #include <linux/bio.h>
-#include <linux/delay.h>
 
 #include "stats.h"
 
 #define dm_name_from_target(ti) \
         (dm_disk(dm_table_get_md(ti->table))->disk_name);
 
+/* 
+ * Current dmp device context
+ */
 struct dmp_c {
         struct dm_dev *dev; /* Underlying block device */
-        struct dmp_stats stat;
-        struct kobject kobj;
-        spinlock_t stat_lock;
+        struct dmp_stats stat; /* Stats of requests to underlying device */
+        struct kobject kobj; /* Parent kobject for current dmp */
+        spinlock_t stat_lock; /* Spinlock for operations with dmp_stats */
 };
 
-static ssize_t reqs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t reqs_show(struct kobject *kobj, struct kobj_attribute *attr,
+                         char *buf)
 {
         struct dmp_c *dmpc = container_of(kobj, struct dmp_c, kobj);
         
         return sysfs_emit(buf,
-                  "read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\n avg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
+                  "read:\n reqs: %llu\n avg size: %llu\nwrite:\n reqs: %llu\n \
+                  avg size: %llu\ntotal:\n reqs: %llu\n avg size: %llu\n",
                   get_read_ops(&dmpc->stat),
                   get_read_avg_size(&dmpc->stat),
                   get_write_ops(&dmpc->stat),
@@ -45,7 +49,9 @@ static struct kobj_type dmp_kobj_type = {
 static struct kset *dmp_dev_stats_kset;
 
 /*
- * Construct a device mapper proxy that collects statistics of I/O operations: <dev_path>
+ * Construct a device mapper proxy
+ * that collects statistics of I/O operations.
+ * Statistics can be found in /sys/module/dmp/dev_stats/dm-<X>/reqs
  */
 static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
@@ -69,14 +75,16 @@ static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
                 return -ENOMEM;
         }
 
-        ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dmpc->dev);
+        ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
+                            &dmpc->dev);
 	if (ret) {
 		ti->error = "Failed to get the underlying device";
                 goto dev_err;
         }
 
         name = dm_name_from_target(ti);
-        ret = kobject_init_and_add(&dmpc->kobj, &dmp_kobj_type, &dmp_dev_stats_kset->kobj, name);
+        ret = kobject_init_and_add(&dmpc->kobj, &dmp_kobj_type,
+                                   &dmp_dev_stats_kset->kobj, name);
         if (ret) {
 		ti->error = "Failed to init kobject";
                 goto kobj_err;
@@ -84,7 +92,7 @@ static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
         ret = sysfs_create_file(&dmpc->kobj, &reqs_attr.attr);
         if (ret) {
-		ti->error = "Cannot create sysfs group";
+		ti->error = "Failed to create sysfs file";
                 goto sysfs_err;
         }
 
@@ -115,6 +123,10 @@ static void dmp_dtr(struct dm_target *ti)
 	kfree(dmpc);
 }
 
+/* 
+ * Identically remaps all requests to underlying device.
+ * Collects read, write requests statistics
+ */
 static int dmp_map(struct dm_target *ti, struct bio *bio)
 {
 	struct dmp_c *dmpc = ti->private;
@@ -145,7 +157,8 @@ static int dmp_map(struct dm_target *ti, struct bio *bio)
 }
 
 static void dmp_status(struct dm_target *ti, status_type_t type,
-			  unsigned int status_flags, char *result, unsigned int maxlen)
+                       unsigned int status_flags, char *result,
+                       unsigned int maxlen)
 {
 	struct dmp_c *dmpc = ti->private;
 	size_t sz = 0;
@@ -181,8 +194,10 @@ static int __init dmp_init(void)
         if (ret < 0) {
             return ret;
         }
-    
-        dmp_dev_stats_kset = kset_create_and_add("dev_stats", NULL, &THIS_MODULE->mkobj.kobj);
+
+        /* Initialize kobject for all devices statistics */
+        dmp_dev_stats_kset = kset_create_and_add("dev_stats", NULL,
+                                                 &THIS_MODULE->mkobj.kobj);
         if (!dmp_dev_stats_kset) {
             dm_unregister_target(&dmp_target);
             return -ENOMEM;
@@ -201,5 +216,5 @@ module_init(dmp_init);
 module_exit(dmp_exit);
 
 MODULE_AUTHOR("Artemii Patov <patov.988@gmail.com>");
-MODULE_DESCRIPTION(DM_NAME "Device mapper proxy that collects statistics of I/O operations");
+MODULE_DESCRIPTION(DM_NAME "Device mapper proxy");
 MODULE_LICENSE("GPL");

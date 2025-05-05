@@ -1,5 +1,5 @@
 /*
-* Read-write operations statistics
+* Read, write requests statistics
 */
 
 #ifndef DMP_STAT_H
