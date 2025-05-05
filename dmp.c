@@ -11,7 +11,7 @@
 (dm_disk(dm_table_get_md(ti->table))->disk_name)
 
 /*
- * Each dmp device context
+ * Per dmp device context
  */
 struct dmp_c {
 	struct dm_dev *dev; /* Underlying block device */
@@ -79,7 +79,7 @@ static struct kset *dmp_dev_stats_kset;
  * Construct a device mapper proxy
  * that collects statistics of read, write operations.
  * Statistics can be found in
- * /sys/module/dmp/dev_stats/dm-<X>/reqs for each device,
+ * /sys/module/dmp/stat/dm-<X>/reqs for each device,
  * /sys/module/dmp/stat/volumes for all devices
  */
 static int dmp_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -229,7 +229,7 @@ static int __init dmp_init(void)
 		return ret;
 
 	/* Initialize kobject for all devices statistics */
-	dmp_dev_stats_kset = kset_create_and_add("dev_stats", NULL,
+	dmp_dev_stats_kset = kset_create_and_add("stat", NULL,
 						 &THIS_MODULE->mkobj.kobj);
 	if (!dmp_dev_stats_kset) {
 		ret = -ENOMEM;

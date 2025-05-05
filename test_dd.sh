@@ -29,6 +29,8 @@ dd if=/dev/urandom of=$INPUT_DATA bs=1M count=16 conv=notrunc oflag=direct
 dd if=$INPUT_DATA of=$MAPPER_DEVICE bs=1M count=16 conv=notrunc oflag=direct
 dd if=$LOOP_FILE of=$OUTPUT_DATA bs=1M count=16 conv=notrunc oflag=direct
 
+cat /sys/module/dmp/stat/volumes
+
 if cmp -s "$INPUT_DATA" "$OUTPUT_DATA"; then
         printf 'PASSED: data was written successfully to the underlying device\n'
 else
