@@ -25,7 +25,7 @@ Purpose: Perform a data integrity test under a significant concurrent random I/O
   - Utilizes bssplit=4k/30:8k/30:16k/30:512k/10 to generate a mix of random I/O sizes (30% 4KB, 30% 8KB, 30% 16KB, 10% 512KB).
   - Sets iodepth=8 and numjobs=8. This creates a high concurrency workload.
   - Uses --direct=1 for direct I/O.
-  - Attempts to write/read 128MB per job, totaling 1GB of I/O.
+  - Attempts to write/read 1G per job.
 - Verification: `fio` performs the SHA256 checksum verification internally during the randread job.
 
 How to run:
