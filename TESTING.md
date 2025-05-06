@@ -11,7 +11,7 @@ Purpose: Perform a basic data integrity test using `dd` utility. This test verif
   - Uses dd with oflag=direct to ensure direct I/O, bypassing page cache effects in the test itself.
 - Verification:
   - Compares the contents of data.in and data.out files.
-  - Reads and prints the content of `/sys/module/dmp/dev_stats/volumes` using `cat`. This allows you to visually inspect the total read/write requests and sizes recorded by the `dmp` module during the write phase of the test.
+  - Reads and prints the content of `/sys/module/dmp/stat/volumes` using `cat`. This allows you to visually inspect the total read/write requests and sizes recorded by the `dmp` module during the write phase of the test.
 
 How to run:
 ```bash
